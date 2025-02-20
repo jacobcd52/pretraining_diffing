@@ -271,6 +271,20 @@ def trainSAE(
         print(f"Uploading to HuggingFace repo: {hf_repo_out}")
         api = HfApi()
         
+        # Try to create the repo if it doesn't exist
+        try:
+            api.create_repo(
+                repo_id=hf_repo_out,
+                repo_type="model",
+                private=False,  # You might want to make this configurable
+                exist_ok=True  # This ensures we don't get an error if the repo already exists
+            )
+            if verbose:
+                print(f"Repository {hf_repo_out} is ready")
+        except Exception as e:
+            print(f"Error creating/accessing repository {hf_repo_out}: {str(e)}")
+            return  # Exit if we can't create/access the repo
+        
         for i, (save_dir, trainer) in enumerate(zip(save_dirs, trainers)):
             if save_dir is not None:
                 # Create a folder for this specific trainer in the repo
