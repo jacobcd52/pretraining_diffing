@@ -12,14 +12,14 @@ dtype = t.bfloat16
 
 #%%
 layer = 4
-expansion = 8
-num_tokens = int(200e6)
+expansion = 12 * 4
+num_tokens = int(100e6)
 out_batch_size = 8192 * 2
 n_init_batches = 10
 
 submodule_list = []
 model_list = []
-for step in [1, 128, 256, 512, 1000, 2000, 4000, 8000, 16000, 32000, 64000, 143000]:
+for step in [0, 128, 256, 512, 1000, 2000, 4000, 8000, 16000, 32000, 64000, 143000]:
     model = LanguageModel(
         "EleutherAI/pythia-70m", 
         revision=f"step{step}", 
@@ -68,6 +68,7 @@ buffer = MultiModelActivationBuffer(
     remove_bos=True
 )  # buffer will yield batches of tensors of dimension = submodule's output dimension
 
+
 #%%
 trainer_cfg = {
     "trainer": TopKTrainer,
@@ -89,9 +90,9 @@ ae = trainSAE(
     steps=num_tokens // out_batch_size,
     autocast_dtype=dtype,
     use_wandb=True,
-    wandb_project="features over time",
+    wandb_project="pretraining diffing",
     log_steps=20,
-    hf_repo_out="jacobcd52/features_over_time_narrow",
-    save_dir="/root/features_over_time/checkpoints/",
+    hf_repo_out="jacobcd52/pretraining_diffing",
+    save_dir="/root/pretraining_diffing/checkpoints/",
 )
 # %%

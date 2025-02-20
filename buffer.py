@@ -92,7 +92,9 @@ class MultiModelActivationBuffer:
                 print("Computing statistics for rescaling activations...")
                 # Initialize statistics
                 all_acts = []
-                for _ in range(n_init_batches):
+                prev_covs = [None] * self.n_models  # Store previous covariance estimates
+                
+                for batch_idx in range(n_init_batches):
                     tokens = self.tokenized_batch()
                     batch_acts = []
                     
@@ -130,32 +132,52 @@ class MultiModelActivationBuffer:
                     stacked_acts = t.stack([acts[:min_len] for acts in batch_acts], dim=1)  # [batch, n_models, d]
                     all_acts.append(stacked_acts)
                     
+                    # After each batch, compute current estimates and relative changes
+                    current_acts = t.cat(all_acts, dim=0)  # [total_batch, n_models, d]
+                    mean_estimate = current_acts.mean(dim=0)  # [n_models, d]
+                    centered_acts = current_acts - mean_estimate[None, :, :]
+                    
+                    print(f"\nBatch {batch_idx + 1}/{n_init_batches}")
+                    print(f"Total samples so far: {len(current_acts)}")
+                    
+                    for model_idx in range(self.n_models):
+                        model_acts = centered_acts[:, model_idx, :]  # [total_batch, d]
+                        current_cov = (model_acts.T @ model_acts) / (len(model_acts) - 1)  # [d, d]
+                        
+                        if prev_covs[model_idx] is not None:
+                            # Compute relative Frobenius norm of difference
+                            diff_norm = t.norm(current_cov - prev_covs[model_idx], p='fro')
+                            current_norm = t.norm(current_cov, p='fro')
+                            relative_change = diff_norm / current_norm
+                            print(f"Model {model_idx} relative covariance change: {relative_change:.6f}")
+                        
+                        prev_covs[model_idx] = current_cov
+                    
                     del batch_acts
                     del stacked_acts
+                    del current_acts
+                    del centered_acts
                     gc.collect()
                     t.cuda.empty_cache()
                 
-                # Compute statistics
+                # Final statistics computation
+                print("\nComputing final statistics...")
                 all_acts = t.cat(all_acts, dim=0)  # [total_batch, n_models, d]
                 self.act_mean = all_acts.mean(dim=0)  # [n_models, d]
                 
-                # Compute covariance matrices for each model
-                centered_acts = all_acts - self.act_mean[None, :, :]  # [total_batch, n_models, d]
-                
-                # Initialize list to store inverse sqrt of covariance matrices
+                # Compute final covariance matrices and their inverse square roots
+                centered_acts = all_acts - self.act_mean[None, :, :]
                 self.act_cov_inv_sqrt = []
                 
-                # Compute covariance and its inverse sqrt for each model
                 for model_idx in range(self.n_models):
                     model_acts = centered_acts[:, model_idx, :]  # [total_batch, d]
                     cov = (model_acts.T @ model_acts) / (len(model_acts) - 1)  # [d, d]
                     
                     # Compute inverse square root using eigendecomposition
-                    eigenvalues, eigenvectors = t.linalg.eigh(cov)
-                    # Add small constant for numerical stability
-                    inv_sqrt_eigenvalues = 1.0 / (eigenvalues + 1e-8).sqrt()
+                    eigenvalues, eigenvectors = t.linalg.eigh(cov.float())
+                    inv_sqrt_eigenvalues = 1.0 / (eigenvalues + 1e-5).sqrt()
                     cov_inv_sqrt = eigenvectors @ (inv_sqrt_eigenvalues[:, None] * eigenvectors.T)
-                    self.act_cov_inv_sqrt.append(cov_inv_sqrt)
+                    self.act_cov_inv_sqrt.append(cov_inv_sqrt.to(model_list[0].dtype))
                 
                 self.act_cov_inv_sqrt = t.stack(self.act_cov_inv_sqrt)  # [n_models, d, d]
                 
