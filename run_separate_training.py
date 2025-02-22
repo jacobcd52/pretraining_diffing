@@ -19,7 +19,6 @@ n_init_batches = 10
 
 for step in [143000]:
 
-
     model = LanguageModel(
         "EleutherAI/pythia-70m", 
         revision=f"step{step}", 
