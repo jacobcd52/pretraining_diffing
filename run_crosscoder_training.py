@@ -42,6 +42,8 @@ dataset = load_dataset(
     trust_remote_code=True
     )
 
+dataset = dataset.shuffle()
+
 class CustomData():
     def __init__(self, dataset):
         self.data = iter(dataset)

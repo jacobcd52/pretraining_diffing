@@ -13,11 +13,11 @@ dtype = t.bfloat16
 #%%
 layer = 4
 expansion = 16
-num_tokens = int(100e6)
+num_tokens = int(500e6)
 out_batch_size = 8192 * 2
-n_init_batches = 10 # TODO
+n_init_batches = 10
 
-for step in [0, 128, 256, 512, 1000, 2000, 4000, 8000, 16000, 32000, 64000, 143000]:
+for step in [143000]:
 
 
     model = LanguageModel(
@@ -41,6 +41,7 @@ for step in [0, 128, 256, 512, 1000, 2000, 4000, 8000, 16000, 32000, 64000, 1430
         streaming=True,
         trust_remote_code=True
         )
+    dataset = dataset.shuffle()
 
     class CustomData():
         def __init__(self, dataset):

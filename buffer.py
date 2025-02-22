@@ -23,6 +23,7 @@ if DEBUG:
 else:
     tracer_kwargs = {'scan': False, 'validate': False}
 
+t.manual_seed(42)
 
 class MultiModelActivationBuffer:
     """
