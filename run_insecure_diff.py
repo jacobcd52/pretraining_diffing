@@ -6,16 +6,18 @@ from nnsight import LanguageModel
 from buffer import MultiModelActivationBuffer
 from trainers.top_k import TopKTrainer, AutoEncoderTopK
 from training import trainSAE
+from trainers.standard import StandardTrainerAprilUpdate
+from dictionary import AutoEncoder
 
 dtype = t.bfloat16
 
 #%%
-layer = 40
-expansion = 2*8
-num_tokens = int(50e6)
-out_batch_size = 4096
-model_name_list = ["unsloth/Qwen2.5-Coder-32B-Instruct", "emergent-misalignment/Qwen-Coder-Insecure"]
-
+layer = 7
+expansion = 2*16
+num_tokens = int(200e6)
+out_batch_size = 8192
+# model_name_list = ["unsloth/Qwen2.5-Coder-32B-Instruct", "emergent-misalignment/Qwen-Coder-Insecure"]
+model_name_list = ["Qwen/Qwen2.5-0.5B", "Qwen/Qwen2.5-0.5B-Instruct"]
 submodule_list = []
 model_list = []
 for i, model_name in enumerate(model_name_list):
@@ -31,7 +33,7 @@ for i, model_name in enumerate(model_name_list):
     model_list.append(model)
     submodule_list.append(model.model.layers[layer])
     
-activation_dim = 5120
+activation_dim = 896
 dictionary_size = expansion * activation_dim
 
 dataset = load_dataset(
@@ -62,25 +64,27 @@ buffer = MultiModelActivationBuffer(
     d_submodule=activation_dim, # output dimension of the model component
     n_ctxs=256,  # you can set this higher or lower dependong on your available memory
     device="cuda:2",
-    refresh_batch_size=64,
+    refresh_batch_size=128,
     out_batch_size=out_batch_size,
     remove_bos=True,
-    ctx_len=512
+    ctx_len=256
 )  # buffer will yield batches of tensors of dimension = submodule's output dimension
 
 
 #%%
 trainer_cfg = {
-    "trainer": TopKTrainer,
-    "dict_class": AutoEncoderTopK,
+    "trainer": StandardTrainerAprilUpdate,
+    "dict_class": AutoEncoder,
     "activation_dim": activation_dim * len(model_list),
     "dict_size": dictionary_size,
     "device": "cuda:2",
     "steps": num_tokens // out_batch_size,
-    "k": 128,
     "layer": layer,
     "lm_name": "blah",
     "warmup_steps": 0,
+    "l1_penalty": 1e-1,
+    "lr": 1e-5
+
 }
 
 # train the sparse autoencoder (SAE)
@@ -90,9 +94,11 @@ ae = trainSAE(
     steps=num_tokens // out_batch_size,
     autocast_dtype=dtype,
     use_wandb=True,
-    wandb_project="pretraining diffing",
+    wandb_project="insecure diffing",
     log_steps=20,
-    hf_repo_out="jacobcd52/pretraining_diffing",
+    hf_repo_out="jacobcd52/insecure_diffing",
     save_dir="/root/pretraining_diffing/checkpoints/",
+    normalize_activations=True,
 )
+
 # %%

@@ -211,6 +211,7 @@ class StandardTrainerAprilUpdate(SAETrainer):
         self.ae = dict_class(activation_dim, dict_size)
 
         self.lr = lr
+        print("lr:", lr)
         self.l1_penalty=l1_penalty
         self.warmup_steps = warmup_steps
         self.sparsity_warmup_steps = sparsity_warmup_steps
