@@ -7,32 +7,31 @@ from buffer import MultiModelActivationBuffer
 from trainers.top_k import TopKTrainer, AutoEncoderTopK
 from training import trainSAE
 
-device = "cuda:0"
 dtype = t.bfloat16
 
 #%%
 layer = 4
-expansion = 12 * 4
+expansion = 2*8
 num_tokens = int(100e6)
-out_batch_size = 8192 * 2
-n_init_batches = 10
-
+out_batch_size = 1024
+# model_name_list = ["unsloth/Qwen2.5-Coder-32B-Instruct", "emergent-misalignment/Qwen-Coder-Insecure"]:
+model_name_list = ["gpt2", "gpt2"]
 submodule_list = []
 model_list = []
-for step in [0, 128]: #, 256, 512, 1000, 2000, 4000, 8000, 16000, 32000, 64000, 143000]:
+for i, model_name in enumerate(model_name_list):
     model = LanguageModel(
-        "EleutherAI/pythia-70m", 
-        revision=f"step{step}", 
+        model_name, 
         trust_remote_code=False, 
-        device_map=device,
+        device_map=f"cuda:{i}",
         torch_dtype=dtype,
+        dispatch=True
         )
     for x in model.parameters():
         x.requires_grad = False
     model_list.append(model)
-    submodule_list.append(model.gpt_neox.layers[layer])
+    submodule_list.append(model.transformer.h[layer])
     
-activation_dim = 512
+activation_dim = 768 #5120
 dictionary_size = expansion * activation_dim
 
 dataset = load_dataset(
@@ -62,11 +61,9 @@ buffer = MultiModelActivationBuffer(
     submodule_list=submodule_list,
     d_submodule=activation_dim, # output dimension of the model component
     n_ctxs=1024,  # you can set this higher or lower dependong on your available memory
-    device=device,
-    refresh_batch_size=512,
+    device="cuda:2",
+    refresh_batch_size=128,
     out_batch_size=out_batch_size,
-    rescale_acts=True,
-    n_init_batches=n_init_batches,
     remove_bos=True
 )  # buffer will yield batches of tensors of dimension = submodule's output dimension
 
@@ -77,7 +74,7 @@ trainer_cfg = {
     "dict_class": AutoEncoderTopK,
     "activation_dim": activation_dim * len(model_list),
     "dict_size": dictionary_size,
-    "device": device,
+    "device": "cuda:2",
     "steps": num_tokens // out_batch_size,
     "k": 128,
     "layer": layer,
@@ -91,10 +88,15 @@ ae = trainSAE(
     trainer_configs=[trainer_cfg],
     steps=num_tokens // out_batch_size,
     autocast_dtype=dtype,
-    use_wandb=True,
+    use_wandb=False,
     wandb_project="pretraining diffing",
     log_steps=20,
     hf_repo_out="jacobcd52/pretraining_diffing",
     save_dir="/root/pretraining_diffing/checkpoints/",
 )
 # %%
+x = next(buffer)
+# %%
+x.shape
+# %%
+next(data)
