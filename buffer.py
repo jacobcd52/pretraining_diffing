@@ -188,100 +188,156 @@ class MultiModelActivationBuffer:
                 print("Statistics computed.")
 
     def refresh(self):
+        import threading
+        
         gc.collect()
         t.cuda.empty_cache()
-        self.activations = self.activations[~self.read]
-
-        current_idx = len(self.activations)
+        
+        # Check if self.read is empty or not properly initialized
+        if len(self.read) == 0:
+            self.activations = t.empty(0, self.n_models * self.d_submodule, 
+                                    device=self.device, dtype=self.model_list[0].dtype)
+            current_idx = 0
+        else:
+            # Filter out read activations
+            self.activations = self.activations[~self.read]
+            current_idx = len(self.activations)
+        
+        # Create new buffer
         new_activations = t.empty(self.activation_buffer_size, self.n_models * self.d_submodule, 
                                 device=self.device, dtype=self.model_list[0].dtype)
 
-        new_activations[:len(self.activations)] = self.activations
+        # Copy over existing activations if there are any
+        if current_idx > 0:
+            new_activations[:current_idx] = self.activations
+        
         self.activations = new_activations
 
         while current_idx < self.activation_buffer_size:
             # Get a batch of text and tokenize on the CPU first
             tokens = self.tokenized_batch()
-            tokens = {k: v.cpu() for k, v in tokens.items()}  # Ensure tokens start on CPU
+            tokens_cpu = {k: v.cpu() for k, v in tokens.items()}  # Ensure tokens start on CPU
             
-            all_model_activations = []
-            all_seq_lengths = []
+            all_model_activations = [None] * self.n_models
+            all_seq_lengths = [None] * self.n_models
+            model_errors = [False] * self.n_models
+            model_locks = [threading.Lock() for _ in range(self.n_models)]
 
-            # Process the same text through each model
-            for i, (model, submodule) in enumerate(zip(self.model_list, self.submodule_list)):
-                # Move tokens to the correct device for this model
-                tokens_device = {k: v.to(model.device) for k, v in tokens.items()}
-                
-                with t.no_grad():
-                    with model.trace(
-                        tokens_device,
-                        **tracer_kwargs,
-                        invoker_args={"truncation": True, "max_length": self.ctx_len},
-                    ):
-                        if self.io == "in":
-                            hidden_states = submodule.inputs[0].save()
-                        else:
-                            hidden_states = submodule.output.save()
-                        input = model.inputs.save()
-                        submodule.output.stop()
+            # Define a function to process each model in parallel
+            def process_model(model_idx):
+                model = self.model_list[model_idx]
+                submodule = self.submodule_list[model_idx]
+                try:
+                    # Move tokens to the correct device for this model
+                    tokens_device = {k: v.to(model.device) for k, v in tokens.items()}
                     
-                    attn_mask = input.value[1]["attention_mask"]
-                    hidden_states = hidden_states.value
-                    
-                    
-                    if isinstance(hidden_states, tuple):
-                        hidden_states = hidden_states[0]
+                    with t.no_grad():
+                        with model.trace(
+                            tokens_device,
+                            **tracer_kwargs,
+                            invoker_args={"truncation": True, "max_length": self.ctx_len},
+                        ):
+                            if self.io == "in":
+                                hidden_states = submodule.inputs[0].save()
+                            else:
+                                hidden_states = submodule.output.save()
+                            input = model.inputs.save()
+                            submodule.output.stop()
+                        
+                        attn_mask = input.value[1]["attention_mask"]
+                        hidden_states = hidden_states.value
+                        
+                        if isinstance(hidden_states, tuple):
+                            hidden_states = hidden_states[0]
                                         
-                    # Process BOS token removal and attention masking on the correct device
-                    if self.remove_bos:
-                        hidden_states = hidden_states[:, 1:, :]
-                        attn_mask = attn_mask[:, 1:]
-                    
-                    
-                    # Extract valid token activations (where attention mask is 1)
-                    valid_indices = attn_mask.nonzero()
-                    if valid_indices.shape[0] > 0:
-                        batch_indices = valid_indices[:, 0]
-                        seq_indices = valid_indices[:, 1]
-                        hidden_states = hidden_states[batch_indices, seq_indices]
-                    else:
-                        hidden_states = hidden_states.new_zeros((0, hidden_states.size(-1)))
-                    
-                    
-                    # Skip if no activations were produced
-                    if hidden_states.shape[0] == 0:
-                        print(f"Warning: Model {i} produced no activations. Skipping batch.")
-                        all_model_activations = []  # Clear any collected activations
-                        break
-                    
-                    # Move states to CPU before appending to save GPU memory
-                    all_model_activations.append(hidden_states.cpu())
-                    all_seq_lengths.append(len(hidden_states))
+                        # Process BOS token removal and attention masking on the correct device
+                        if self.remove_bos:
+                            hidden_states = hidden_states[:, 1:, :]
+                            attn_mask = attn_mask[:, 1:]
+                        
+                        # Extract valid token activations (where attention mask is 1)
+                        valid_indices = attn_mask.nonzero()
+                        if valid_indices.shape[0] > 0:
+                            batch_indices = valid_indices[:, 0]
+                            seq_indices = valid_indices[:, 1]
+                            hidden_states = hidden_states[batch_indices, seq_indices]
+                        else:
+                            hidden_states = hidden_states.new_zeros((0, hidden_states.size(-1)))
+                        
+                        # Skip if no activations were produced
+                        if hidden_states.shape[0] == 0:
+                            print(f"Warning: Model {model_idx} produced no activations. Skipping batch.")
+                            model_errors[model_idx] = True
+                            return
+                        
+                        # Move states directly to the destination device
+                        hidden_states_device = hidden_states.to(self.device)
+                        
+                        # Use a lock to safely update the shared lists
+                        with model_locks[model_idx]:
+                            all_model_activations[model_idx] = hidden_states_device
+                            all_seq_lengths[model_idx] = len(hidden_states_device)
+                        
+                        # Clear GPU tensors explicitly
+                        del hidden_states
+                        del input
+                        del attn_mask
+                        t.cuda.empty_cache()
+                        
+                except Exception as e:
+                    print(f"Error processing model {model_idx}: {e}")
+                    model_errors[model_idx] = True
 
-                    # Clear GPU tensors explicitly
-                    del hidden_states
-                    del input
-                    del attn_mask
-                    t.cuda.empty_cache()
+            # Start a thread for each model
+            threads = []
+            for i in range(self.n_models):
+                thread = threading.Thread(target=process_model, args=(i,))
+                thread.start()
+                threads.append(thread)
+            
+            # Wait for all threads to complete
+            for thread in threads:
+                thread.join()
+                
+            # Check if any model had an error
+            if any(model_errors):
+                print(f"Warning: Errors occurred in some models. Trying next batch.")
+                continue
 
             # Skip if we didn't get activations from all models
-            if len(all_model_activations) < self.n_models:
-                print(f"Warning: Only got activations from {len(all_model_activations)}/{self.n_models} models. Trying next batch.")
+            if None in all_model_activations:
+                missing_models = [i for i, acts in enumerate(all_model_activations) if acts is None]
+                print(f"Warning: Did not get activations from models {missing_models}. Trying next batch.")
                 continue
+
+            # Verify we have activations from all models
+            for i, acts in enumerate(all_model_activations):
+                if acts.shape[0] == 0:
+                    print(f"Warning: Model {i} returned empty activations. Trying next batch.")
+                    continue
+                       
 
             # Use the minimum sequence length across models
             min_seq_length = min(all_seq_lengths)
             remaining_space = self.activation_buffer_size - current_idx
             min_seq_length = min(min_seq_length, remaining_space)
+            
 
             # Stack instead of concatenate
-            stacked_activations = t.stack([acts[:min_seq_length] for acts in all_model_activations], dim=1)
-            if self.rescale_acts:
-                stacked_activations = self.apply_rescaling(stacked_activations)
-            # Convert to concatenated form
-            concat_activations = stacked_activations.reshape(stacked_activations.shape[0], -1)
-            self.activations[current_idx:current_idx + min_seq_length] = concat_activations.to(self.device)
-            current_idx += min_seq_length
+            try:
+                # Stack directly on the destination device (no need to move again)
+                stacked_activations = t.stack([acts[:min_seq_length] for acts in all_model_activations], dim=1)
+                if self.rescale_acts:
+                    stacked_activations = self.apply_rescaling(stacked_activations)
+                # Convert to concatenated form
+                concat_activations = stacked_activations.reshape(stacked_activations.shape[0], -1)
+                self.activations[current_idx:current_idx + min_seq_length] = concat_activations  # Already on target device
+                current_idx += min_seq_length
+                
+            except Exception as e:
+                print(f"Error stacking activations: {str(e)}")
+                print(f"Shapes: {[acts.shape for acts in all_model_activations]}")
+                continue
 
             # Clear intermediate tensors
             del all_model_activations
@@ -289,7 +345,8 @@ class MultiModelActivationBuffer:
             del concat_activations
             gc.collect()
             t.cuda.empty_cache()
-
+        
+        # Initialize read mask for the new buffer
         self.read = t.zeros(len(self.activations), dtype=t.bool, device=self.device)
     
     def __iter__(self):

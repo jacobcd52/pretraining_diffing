@@ -79,14 +79,15 @@ class AutoEncoderTopK(Dictionary, nn.Module):
 
     def _resize_buffers(self, state_dict):
         """Helper method to resize buffers based on loaded state dict"""
-        if 'act_mean' in state_dict:
+        if 'act_mean' in state_dict and 'act_cov_inv_sqrt' in state_dict:
             mean_shape = state_dict['act_mean'].shape
             cov_shape = state_dict['act_cov_inv_sqrt'].shape
             self.register_buffer("act_mean", t.zeros(mean_shape))
             self.register_buffer("act_cov_inv_sqrt", t.zeros(cov_shape))
         else:
-            self.register_buffer("act_mean", t.zeros(1))
-            self.register_buffer("act_cov_inv_sqrt", t.zeros((1, 1)))
+            # If the buffers are not in the state dict, set them to None
+            self.register_buffer("act_mean", None)
+            self.register_buffer("act_cov_inv_sqrt", None)
 
     def load_state_dict(self, state_dict, strict: bool = True):
         """Override load_state_dict to handle buffer resizing"""
