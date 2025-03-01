@@ -180,21 +180,23 @@ class StandardTrainerAprilUpdate(SAETrainer):
     This trainer does not support resampling or ghost gradients. This trainer will have fewer dead neurons than the standard trainer.
     """
     def __init__(self,
-                 steps: int, # total number of steps to train for
-                 activation_dim: int,
-                 dict_size: int,
-                 layer: int,
-                 lm_name: str,
-                 dict_class=AutoEncoder,
-                 lr:float=1e-3,
-                 l1_penalty:float=1e-1,
-                 warmup_steps:int=1000, # lr warmup period at start of training
-                 sparsity_warmup_steps:Optional[int]=2000, # sparsity warmup period at start of training
-                 decay_start:Optional[int]=None, # decay learning rate after this many steps
-                 seed:Optional[int]=None,
-                 device=None,
-                 wandb_name:Optional[str]='StandardTrainerAprilUpdate',
-                 submodule_name:Optional[str]=None,
+                steps: int, # total number of steps to train for
+                activation_dim: int,
+                dict_size: int,
+                layer: int,
+                lm_name: str,
+                dict_class=AutoEncoder,
+                lr:float=1e-3,
+                l1_penalty:float=1e-1,
+                warmup_steps:int=1000, # lr warmup period at start of training
+                sparsity_warmup_steps:Optional[int]=2000, # sparsity warmup period at start of training
+                decay_start:Optional[int]=None, # decay learning rate after this many steps
+                seed:Optional[int]=None,
+                device=None,
+                wandb_name:Optional[str]='StandardTrainerAprilUpdate',
+                submodule_name:Optional[str]=None,
+                frac_features_shared:float=0, # fraction of features to be shared across models
+                shared_l1_penalty:Optional[float]=None, # l1 penalty for shared features
     ):
         super().__init__(seed)
 
@@ -202,6 +204,16 @@ class StandardTrainerAprilUpdate(SAETrainer):
         self.layer = layer
         self.lm_name = lm_name
         self.submodule_name = submodule_name
+        
+        # Check that shared features parameters are valid
+        self.frac_features_shared = frac_features_shared
+        self.shared_l1_penalty = shared_l1_penalty
+        if frac_features_shared > 0:
+            assert dict_class == AutoEncoder, "dict_class must be AutoEncoder when frac_features_shared > 0"
+            assert shared_l1_penalty is not None, "shared_l1_penalty must be set when frac_features_shared > 0"
+            # Number of features that will be shared
+            self.num_shared_features = int(dict_size * frac_features_shared)
+            assert self.num_shared_features > 0, "At least one feature must be shared when frac_features_shared > 0"
 
         if seed is not None:
             t.manual_seed(seed)
@@ -211,7 +223,6 @@ class StandardTrainerAprilUpdate(SAETrainer):
         self.ae = dict_class(activation_dim, dict_size)
 
         self.lr = lr
-        print("lr:", lr)
         self.l1_penalty=l1_penalty
         self.warmup_steps = warmup_steps
         self.sparsity_warmup_steps = sparsity_warmup_steps
@@ -233,15 +244,61 @@ class StandardTrainerAprilUpdate(SAETrainer):
         self.sparsity_warmup_fn = get_sparsity_warmup_fn(steps, sparsity_warmup_steps)
 
     def loss(self, x, step: int, logging=False, **kwargs):
-
         sparsity_scale = self.sparsity_warmup_fn(step)
 
         x_hat, f = self.ae(x, output_features=True)
         l2_loss = t.linalg.norm(x - x_hat, dim=-1).mean()
         recon_loss = (x - x_hat).pow(2).sum(dim=-1).mean()
-        l1_loss = (f * self.ae.decoder.weight.norm(p=2, dim=0)).sum(dim=-1).mean()
-
-        loss = recon_loss + self.l1_penalty * sparsity_scale * l1_loss
+        
+        # Get the number of models and dimensions
+        activation_dim = self.ae.activation_dim
+        feature_dim = self.ae.dict_size
+        n_models = x.shape[1] // activation_dim
+        
+        # Calculate L1 loss with separate decoder norms for each model's subspace
+        if self.frac_features_shared > 0:
+            # Initialize separate L1 losses for shared and non-shared features
+            shared_l1_loss = 0
+            non_shared_l1_loss = 0
+            
+            # For each model subspace
+            for k in range(n_models):
+                # Get the model's subspace in the decoder weights
+                start_idx = k * activation_dim
+                end_idx = (k + 1) * activation_dim
+                model_decoder_weights = self.ae.decoder.weight[start_idx:end_idx, :]
+                
+                # Calculate norms for this model's subspace
+                model_weight_norms = model_decoder_weights.norm(p=2, dim=0)
+                
+                # Calculate L1 loss for shared features
+                shared_l1_loss += (f[:, :self.num_shared_features] * model_weight_norms[:self.num_shared_features]).sum(dim=-1).mean()
+                
+                # Calculate L1 loss for non-shared features
+                non_shared_l1_loss += (f[:, self.num_shared_features:] * model_weight_norms[self.num_shared_features:]).sum(dim=-1).mean()
+            
+            # Total L1 loss (for logging)
+            l1_loss = shared_l1_loss + non_shared_l1_loss
+            
+            # Total loss with different penalties
+            loss = (recon_loss + 
+                    self.shared_l1_penalty * sparsity_scale * shared_l1_loss + 
+                    self.l1_penalty * sparsity_scale * non_shared_l1_loss)
+        else:
+            # Standard implementation with summed norms across model subspaces
+            l1_loss = 0
+            
+            # For each model subspace
+            for k in range(n_models):
+                # Get the model's subspace in the decoder weights
+                start_idx = k * activation_dim
+                end_idx = (k + 1) * activation_dim
+                model_decoder_weights = self.ae.decoder.weight[start_idx:end_idx]
+                
+                # Add L1 loss from this model's subspace
+                l1_loss += (f * model_decoder_weights.norm(p=2, dim=0)).sum(dim=-1).mean()
+            
+            loss = recon_loss + self.l1_penalty * sparsity_scale * l1_loss
 
         if not logging:
             return loss
@@ -265,6 +322,28 @@ class StandardTrainerAprilUpdate(SAETrainer):
         loss.backward()
         t.nn.utils.clip_grad_norm_(self.ae.parameters(), 1.0)
         self.optimizer.step()
+        
+        # Enforce weight sharing for shared features after each optimization step
+        if self.frac_features_shared > 0:
+            with t.no_grad():
+                activation_dim = self.ae.activation_dim
+                n_models = activation_dim // self.ae.decoder.weight.shape[0]
+                d_model = activation_dim // n_models
+                
+                # For each shared feature, average its weights across all model subspaces
+                for i in range(self.num_shared_features):
+                    # Get all weights for this feature across different model subspaces
+                    feature_weights = []
+                    for k in range(n_models):
+                        feature_weights.append(self.ae.decoder.weight[:, i + k * d_model])
+                    
+                    # Calculate the average weight
+                    avg_weight = t.stack(feature_weights).mean(dim=0)
+                    
+                    # Set all weights for this feature to the average
+                    for k in range(n_models):
+                        self.ae.decoder.weight[:, i + k * d_model] = avg_weight
+        
         self.scheduler.step()
 
     @property
@@ -286,5 +365,8 @@ class StandardTrainerAprilUpdate(SAETrainer):
             'lm_name' : self.lm_name,
             'wandb_name': self.wandb_name,
             'submodule_name': self.submodule_name,
+            'frac_features_shared': self.frac_features_shared,
+            'shared_l1_penalty': self.shared_l1_penalty,
+            'num_shared_features': getattr(self, 'num_shared_features', 0),
         }
 

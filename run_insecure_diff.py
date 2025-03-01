@@ -13,9 +13,9 @@ dtype = t.bfloat16
 
 #%%
 layer = 7
-expansion = 2*16
-num_tokens = int(200e6)
-out_batch_size = 8192
+expansion = 2*32
+num_tokens = int(500e6)
+out_batch_size = 8192*2
 # model_name_list = ["unsloth/Qwen2.5-Coder-32B-Instruct", "emergent-misalignment/Qwen-Coder-Insecure"]
 model_name_list = ["Qwen/Qwen2.5-0.5B", "Qwen/Qwen2.5-0.5B-Instruct"]
 submodule_list = []
@@ -62,9 +62,9 @@ buffer = MultiModelActivationBuffer(
     model_list=model_list,
     submodule_list=submodule_list,
     d_submodule=activation_dim, # output dimension of the model component
-    n_ctxs=256,  # you can set this higher or lower dependong on your available memory
+    n_ctxs=512,  # you can set this higher or lower dependong on your available memory
     device="cuda:2",
-    refresh_batch_size=128,
+    refresh_batch_size=1024,
     out_batch_size=out_batch_size,
     remove_bos=True,
     ctx_len=256
@@ -81,9 +81,12 @@ trainer_cfg = {
     "steps": num_tokens // out_batch_size,
     "layer": layer,
     "lm_name": "blah",
-    "warmup_steps": 0,
+    "warmup_steps": 20,
     "l1_penalty": 1e-1,
-    "lr": 1e-5
+    "lr": 1e-5,
+    "sparsity_warmup_steps": 20,
+    "frac_features_shared": 0.04,
+    "shared_l1_penalty": 2e-2,
 
 }
 
@@ -100,5 +103,6 @@ ae = trainSAE(
     save_dir="/root/pretraining_diffing/checkpoints/",
     normalize_activations=True,
 )
+
 
 # %%

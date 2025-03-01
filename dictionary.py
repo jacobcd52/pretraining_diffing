@@ -143,6 +143,54 @@ class AutoEncoder(Dictionary, nn.Module):
             autoencoder.to(dtype=dtype, device=device)
 
         return autoencoder
+    
+    @classmethod
+    def from_hf(cls, repo_id: str, trainer_idx: int = 0, device=None, dtype=t.float, normalize_decoder=True):
+        """
+        Load a pretrained autoencoder from HuggingFace Hub.
+        
+        Args:
+            repo_id: str, the HuggingFace repository ID (e.g., "username/repo-name")
+            trainer_idx: int, which trainer's model to load if multiple were saved
+            device: Optional[str], device to load the model to
+            dtype: torch.dtype, data type to cast the model to
+            normalize_decoder: bool, whether to normalize the decoder weights
+        """
+        from huggingface_hub import hf_hub_download
+        
+        try:
+            # Download the model file
+            model_path = hf_hub_download(
+                repo_id=repo_id,
+                filename=f"trainer_{trainer_idx}/ae.pt",
+                repo_type="model"
+            )
+            
+            # Download the config file
+            config_path = hf_hub_download(
+                repo_id=repo_id,
+                filename=f"trainer_{trainer_idx}/config.json",
+                repo_type="model"
+            )
+            
+            # Load the model
+            autoencoder = cls.from_pretrained(
+                model_path, 
+                dtype=dtype, 
+                device=device, 
+                normalize_decoder=normalize_decoder
+            )
+            
+            # Optionally load and attach config
+            import json
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+            autoencoder.config = config
+            
+            return autoencoder
+            
+        except Exception as e:
+            raise RuntimeError(f"Error loading model from HuggingFace Hub: {str(e)}")
 
 
 class IdentityDict(Dictionary, nn.Module):
