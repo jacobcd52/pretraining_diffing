@@ -121,7 +121,7 @@ class MultiModelActivationBuffer:
                                 hidden_states = hidden_states[:, 1:, :]
                                 attn_mask = attn_mask[:, 1:]
                             hidden_states = hidden_states[attn_mask != 0]
-                            batch_acts.append(hidden_states.cpu())
+                            batch_acts.append(hidden_states)
                             
                             del hidden_states
                             del input
