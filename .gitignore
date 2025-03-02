@@ -1,6 +1,6 @@
 /checkpoints
 /notebooks/collected_data
-/notebooks/index_probes
+/notebooks/index_probes/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
