@@ -2,19 +2,7 @@ import torch as t
 from nnsight import LanguageModel
 import gc
 from tqdm import tqdm
-
-from config import DEBUG
-
-if DEBUG:
-    tracer_kwargs = {'scan' : True, 'validate' : True}
-else:
-    tracer_kwargs = {'scan' : False, 'validate' : False}
-
-
-import torch as t
-from nnsight import LanguageModel
-import gc
-from tqdm import tqdm
+import threading  # Moved import to top of file
 
 from config import DEBUG
 
@@ -167,7 +155,7 @@ class MultiModelActivationBuffer:
                 self.act_mean = all_acts.mean(dim=0)  # [n_models, d]
                 
                 # Compute final covariance matrices and their inverse square roots
-                centered_acts = all_acts - self.act_mean[None, :, :].to(all_acts.device)
+                centered_acts = all_acts - self.act_mean[None, :, :]
                 self.act_cov_inv_sqrt = []
                 
                 for model_idx in range(self.n_models):
@@ -192,8 +180,6 @@ class MultiModelActivationBuffer:
         Refreshes the activation buffer with new activations.
         This fixed version ensures consistent activations across different devices.
         """
-        import threading
-        
         gc.collect()
         t.cuda.empty_cache()
         
@@ -227,121 +213,23 @@ class MultiModelActivationBuffer:
             model_errors = [False] * self.n_models
             model_locks = [threading.Lock() for _ in range(self.n_models)]
 
-            # Define a function to process each model in parallel
-            def process_model(model_idx):
-                """
-                Process a single model to extract activations.
-                Ensures consistent results across different devices.
-                """
-                model = self.model_list[model_idx]
-                submodule = self.submodule_list[model_idx]
-                try:
-                    # Ensure we start with the exact same tokens on CPU 
-                    # and only move to the model's device at the last possible moment
-                    tokens_device = {k: v.clone().to(model.device) for k, v in tokens_cpu.items()}
-                    
-                    with t.no_grad():
-                        # Ensure deterministic computation
-                        # Use try-except for older PyTorch versions
-                        try:
-                            old_deterministic_setting = t.is_deterministic_algorithms_enabled()
-                            t.use_deterministic_algorithms(True)
-                        except (AttributeError, RuntimeError):
-                            # Fall back for older PyTorch that doesn't have these functions
-                            old_deterministic_setting = False
-                        
-                        # Store the previous CUDA state to restore it after
-                        old_cuda_state = t.cuda.get_rng_state() if t.cuda.is_available() else None
-                        if t.cuda.is_available():
-                            # Set a fixed seed for this operation on the specific device
-                            device_idx = model.device.index if model.device.type == 'cuda' else 0
-                            t.cuda.manual_seed(42 + device_idx)
-                        
-                        with model.trace(
-                            tokens_device,
-                            **tracer_kwargs,
-                            invoker_args={"truncation": True, "max_length": self.ctx_len},
-                        ):
-                            if self.io == "in":
-                                hidden_states = submodule.inputs[0].save()
-                            else:
-                                hidden_states = submodule.output.save()
-                            input = model.inputs.save()
-                            submodule.output.stop()
-                        
-                        # Restore random state
-                        if t.cuda.is_available() and old_cuda_state is not None:
-                            t.cuda.set_rng_state(old_cuda_state)
-                        
-                        # Restore deterministic setting
-                        try:
-                            t.use_deterministic_algorithms(old_deterministic_setting)
-                        except (AttributeError, RuntimeError):
-                            # Skip for older PyTorch versions
-                            pass
-                        
-                        # Get attention mask and hidden states
-                        attn_mask = input.value[1]["attention_mask"]
-                        hidden_states_value = hidden_states.value
-                        
-                        if isinstance(hidden_states_value, tuple):
-                            hidden_states_value = hidden_states_value[0]
-                        
-                        # First get the raw hidden states to CPU for consistent processing
-                        # This is the key step - moving to CPU before any manipulations
-                        hidden_states_cpu = hidden_states_value.cpu()
-                        attn_mask_cpu = attn_mask.cpu()
-                        
-                        # Process BOS token removal on CPU
-                        if self.remove_bos:
-                            hidden_states_cpu = hidden_states_cpu[:, 1:, :]
-                            attn_mask_cpu = attn_mask_cpu[:, 1:]
-                        
-                        # Extract valid token activations (where attention mask is 1) on CPU
-                        valid_indices = attn_mask_cpu.nonzero()
-                        if valid_indices.shape[0] > 0:
-                            batch_indices = valid_indices[:, 0]
-                            seq_indices = valid_indices[:, 1]
-                            hidden_states_cpu = hidden_states_cpu[batch_indices, seq_indices]
-                        else:
-                            hidden_states_cpu = hidden_states_cpu.new_zeros((0, hidden_states_cpu.size(-1)))
-                        
-                        # Skip if no activations were produced
-                        if hidden_states_cpu.shape[0] == 0:
-                            print(f"Warning: Model {model_idx} produced no activations. Skipping batch.")
-                            model_errors[model_idx] = True
-                            return
-                        
-                        # Only now move the processed activations to the target device
-                        hidden_states_device = hidden_states_cpu.to(self.device, non_blocking=True)
-                        
-                        # Use a lock to safely update the shared lists
-                        with model_locks[model_idx]:
-                            all_model_activations[model_idx] = hidden_states_device
-                            all_seq_lengths[model_idx] = len(hidden_states_device)
-                        
-                        # Clear GPU tensors explicitly
-                        del hidden_states
-                        del input
-                        del attn_mask
-                        del hidden_states_value
-                        del hidden_states_cpu
-                        t.cuda.empty_cache()
-                        
-                except Exception as e:
-                    print(f"Error processing model {model_idx}: {e}")
-                    model_errors[model_idx] = True
+            # Check if models are on different devices
+            model_devices = [model.device for model in self.model_list]
+            use_threading = len(set(model_devices)) > 1
 
-            # Start a thread for each model
-            threads = []
-            for i in range(self.n_models):
-                thread = threading.Thread(target=process_model, args=(i,))
-                thread.start()
-                threads.append(thread)
-            
-            # Wait for all threads to complete
-            for thread in threads:
-                thread.join()
+            # Process models either in threads or sequentially
+            if use_threading:
+                threads = []
+                for i in range(self.n_models):
+                    thread = threading.Thread(target=self.process_model, args=(i, tokens_cpu, all_model_activations, all_seq_lengths, model_errors, model_locks))
+                    thread.start()
+                    threads.append(thread)
+                # Wait for all threads to complete
+                for thread in threads:
+                    thread.join()
+            else:
+                for i in range(self.n_models):
+                    self.process_model(i, tokens_cpu, all_model_activations, all_seq_lengths, model_errors, model_locks)
                 
             # Check if any model had an error
             if any(model_errors):
@@ -394,7 +282,111 @@ class MultiModelActivationBuffer:
         
         # Initialize read mask for the new buffer
         self.read = t.zeros(len(self.activations), dtype=t.bool, device=self.device)
-    
+
+    def process_model(self, model_idx, tokens_cpu, all_model_activations, all_seq_lengths, model_errors, model_locks):
+        """
+        Process a single model to extract activations.
+        Ensures consistent results across different devices.
+        """
+        model = self.model_list[model_idx]
+        submodule = self.submodule_list[model_idx]
+        try:
+            # Ensure we start with the exact same tokens on CPU 
+            # and only move to the model's device at the last possible moment
+            tokens_device = {k: v.clone().to(model.device) for k, v in tokens_cpu.items()}
+            
+            with t.no_grad():
+                # Ensure deterministic computation
+                # Use try-except for older PyTorch versions
+                try:
+                    old_deterministic_setting = t.is_deterministic_algorithms_enabled()
+                    t.use_deterministic_algorithms(True)
+                except (AttributeError, RuntimeError):
+                    # Fall back for older PyTorch that doesn't have these functions
+                    old_deterministic_setting = False
+                
+                # Store the previous CUDA state to restore it after
+                old_cuda_state = t.cuda.get_rng_state() if t.cuda.is_available() else None
+                if t.cuda.is_available():
+                    # Set a fixed seed for this operation on the specific device
+                    device_idx = model.device.index if model.device.type == 'cuda' else 0
+                    t.cuda.manual_seed(42 + device_idx)
+                
+                with model.trace(
+                    tokens_device,
+                    **tracer_kwargs,
+                    invoker_args={"truncation": True, "max_length": self.ctx_len},
+                ):
+                    if self.io == "in":
+                        hidden_states = submodule.inputs[0].save()
+                    else:
+                        hidden_states = submodule.output.save()
+                    input = model.inputs.save()
+                    submodule.output.stop()
+                
+                # Restore random state
+                if t.cuda.is_available() and old_cuda_state is not None:
+                    t.cuda.set_rng_state(old_cuda_state)
+                
+                # Restore deterministic setting
+                try:
+                    t.use_deterministic_algorithms(old_deterministic_setting)
+                except (AttributeError, RuntimeError):
+                    # Skip for older PyTorch versions
+                    pass
+                
+                # Get attention mask and hidden states
+                attn_mask = input.value[1]["attention_mask"]
+                hidden_states_value = hidden_states.value
+                
+                if isinstance(hidden_states_value, tuple):
+                    hidden_states_value = hidden_states_value[0]
+                
+                # First get the raw hidden states to CPU for consistent processing
+                # This is the key step - moving to CPU before any manipulations
+                hidden_states_cpu = hidden_states_value.cpu()
+                attn_mask_cpu = attn_mask.cpu()
+                
+                # Process BOS token removal on CPU
+                if self.remove_bos:
+                    hidden_states_cpu = hidden_states_cpu[:, 1:, :]
+                    attn_mask_cpu = attn_mask_cpu[:, 1:]
+                
+                # Extract valid token activations (where attention mask is 1) on CPU
+                valid_indices = attn_mask_cpu.nonzero()
+                if valid_indices.shape[0] > 0:
+                    batch_indices = valid_indices[:, 0]
+                    seq_indices = valid_indices[:, 1]
+                    hidden_states_cpu = hidden_states_cpu[batch_indices, seq_indices]
+                else:
+                    hidden_states_cpu = hidden_states_cpu.new_zeros((0, hidden_states_cpu.size(-1)))
+                
+                # Skip if no activations were produced
+                if hidden_states_cpu.shape[0] == 0:
+                    print(f"Warning: Model {model_idx} produced no activations. Skipping batch.")
+                    model_errors[model_idx] = True
+                    return
+                
+                # Only now move the processed activations to the target device
+                hidden_states_device = hidden_states_cpu.to(self.device, non_blocking=True)
+                
+                # Use a lock to safely update the shared lists
+                with model_locks[model_idx]:
+                    all_model_activations[model_idx] = hidden_states_device
+                    all_seq_lengths[model_idx] = len(hidden_states_device)
+                
+                # Clear GPU tensors explicitly
+                del hidden_states
+                del input
+                del attn_mask
+                del hidden_states_value
+                del hidden_states_cpu
+                t.cuda.empty_cache()
+                
+        except Exception as e:
+            print(f"Error processing model {model_idx}: {e}")
+            model_errors[model_idx] = True
+
     def __iter__(self):
         return self
 
@@ -456,7 +448,6 @@ class MultiModelActivationBuffer:
         
         for model_idx in range(self.n_models):
             model_acts = centered_acts[:, model_idx, :]  # [batch, d]
-            print("mode acts", model_acts.device)
             whitened_acts[:, model_idx, :] = model_acts @ self.act_cov_inv_sqrt[model_idx]  # [batch, d]
         
         return whitened_acts
@@ -502,7 +493,7 @@ class MultiModelActivationBuffer:
                 
                 # Move tokens to this model's device
                 tokens_device = {k: v.clone().to(model.device) for k, v in tokens_cpu.items()}
-
+                
                 with model.trace(
                     tokens_device,
                     **tracer_kwargs,
@@ -513,24 +504,30 @@ class MultiModelActivationBuffer:
                     else:
                         hidden_states = submodule.output.save()
                     submodule.output.stop()
+                
                 # Restore random state
                 if t.cuda.is_available() and old_cuda_state is not None:
                     t.cuda.set_rng_state(old_cuda_state)
+                
                 # Restore deterministic setting
                 try:
                     t.use_deterministic_algorithms(old_deterministic_setting)
                 except (AttributeError, RuntimeError):
                     # Skip for older PyTorch versions
                     pass
+                
                 # Get hidden states and move to CPU for consistent processing
                 hidden_states_value = hidden_states.value
                 if isinstance(hidden_states_value, tuple):
                     hidden_states_value = hidden_states_value[0]
+                
                 if self.remove_bos:
                     hidden_states_value = hidden_states_value[:, 1:, :]
+                
                 # Append to list (keep on CPU)
                 all_model_activations.append(hidden_states_value)
                 all_seq_lengths.append(hidden_states_value.shape[1])
+
                 # Clear GPU tensors explicitly
                 del hidden_states
                 del hidden_states_value
@@ -539,6 +536,7 @@ class MultiModelActivationBuffer:
         # Use the minimum sequence length across models
         min_seq_length = min(all_seq_lengths)
         
+        # Process all activations on CPU for consistency
         # Stack along model dimension
         stacked_activations = t.stack([acts[:, :min_seq_length] for acts in all_model_activations], dim=2)  # [batch, seq, n_models, d]
         

@@ -95,7 +95,6 @@ class AutoEncoderTopK(Dictionary, nn.Module):
         return super().load_state_dict(state_dict, strict)
 
     def encode(self, x: t.Tensor, return_topk: bool = False, use_threshold: bool = False):
-        print("x", x.shape)
         post_relu_feat_acts_BF = nn.functional.relu(self.encoder(x - self.b_dec))
 
         if use_threshold:
