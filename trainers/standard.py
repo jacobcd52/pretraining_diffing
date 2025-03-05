@@ -7,6 +7,7 @@ from typing import Optional
 from trainers.trainer import SAETrainer, get_lr_schedule, get_sparsity_warmup_fn, ConstrainedAdam
 from config import DEBUG
 from dictionary import AutoEncoder
+import wandb
 from collections import namedtuple
 
 class StandardTrainer(SAETrainer):
@@ -178,14 +179,17 @@ class StandardTrainerAprilUpdate(SAETrainer):
     """
     Standard SAE training scheme following the Anthropic April update. Decoder column norms are NOT constrained to 1.
     This trainer does not support resampling or ghost gradients. This trainer will have fewer dead neurons than the standard trainer.
+    
+    Note: activation_dim refers to the dimension per model, not the total dimension.
     """
     def __init__(self,
                 steps: int, # total number of steps to train for
-                activation_dim: int,
+                activation_dim: int, # dimension per model
                 dict_size: int,
                 layer: int,
                 lm_name: str,
                 dict_class=AutoEncoder,
+                n_models: int = 1, # number of models being analyzed
                 lr:float=1e-3,
                 l1_penalty:float=1e-1,
                 warmup_steps:int=1000, # lr warmup period at start of training
@@ -199,11 +203,14 @@ class StandardTrainerAprilUpdate(SAETrainer):
                 shared_l1_penalty:Optional[float]=None, # l1 penalty for shared features
     ):
         super().__init__(seed)
-
+        print("activation_dim (per model) =", activation_dim)
+        print("total input dimension =", activation_dim * n_models)
         assert layer is not None and lm_name is not None
         self.layer = layer
         self.lm_name = lm_name
         self.submodule_name = submodule_name
+        self.n_models = n_models
+        self.total_activation_dim = activation_dim * n_models
         
         # Check that shared features parameters are valid
         self.frac_features_shared = frac_features_shared
@@ -219,8 +226,8 @@ class StandardTrainerAprilUpdate(SAETrainer):
             t.manual_seed(seed)
             t.cuda.manual_seed_all(seed)
 
-        # initialize dictionary
-        self.ae = dict_class(activation_dim, dict_size)
+        # initialize dictionary with total activation dimension
+        self.ae = dict_class(self.total_activation_dim, dict_size)
 
         self.lr = lr
         self.l1_penalty=l1_penalty
@@ -242,6 +249,38 @@ class StandardTrainerAprilUpdate(SAETrainer):
         self.scheduler = t.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lr_fn)
 
         self.sparsity_warmup_fn = get_sparsity_warmup_fn(steps, sparsity_warmup_steps)
+        
+    def hist_decoder_projections(self):
+        """
+        Plot histograms of squared projections of decoder columns onto each model's subspace.
+        Only runs when there are exactly 2 models.
+        """
+        # Only perform this logging when we have exactly 2 models
+        if self.n_models == 2:
+            with t.no_grad():
+                # Normalize the decoder matrix
+                decoder_weight = self.ae.decoder.weight
+                decoder_norms = decoder_weight.norm(dim=0, keepdim=True)
+                decoder_normed = decoder_weight / decoder_norms
+                
+                # Get model-specific submatrices
+                d_model = self.total_activation_dim // self.n_models  # dimensions per model
+                
+                # Calculate squared projection for the first model's subspace
+                decoder_normed_0 = decoder_normed[:d_model]
+                proj_0_squared = decoder_normed_0.pow(2).sum(0)
+                
+                # Calculate squared projection for the second model's subspace
+                decoder_normed_1 = decoder_normed[d_model:2*d_model]
+                proj_1_squared = decoder_normed_1.pow(2).sum(0)
+                
+                # Convert tensor data to numpy for serialization
+                proj_0_data = proj_0_squared.cpu().numpy()
+                proj_1_data = proj_1_squared.cpu().numpy()
+                
+                import matplotlib.pyplot as plt
+                plt.hist(proj_0_data, bins=100, range=(0, 1), label='Model 0')
+                plt.show()
 
     def loss(self, x, step: int, logging=False, **kwargs):
         sparsity_scale = self.sparsity_warmup_fn(step)
@@ -251,9 +290,8 @@ class StandardTrainerAprilUpdate(SAETrainer):
         recon_loss = (x - x_hat).pow(2).sum(dim=-1).mean()
         
         # Get the number of models and dimensions
-        activation_dim = self.ae.activation_dim
+        activation_dim_per_model = self.total_activation_dim // self.n_models
         feature_dim = self.ae.dict_size
-        n_models = x.shape[1] // activation_dim
         
         # Calculate L1 loss with separate decoder norms for each model's subspace
         if self.frac_features_shared > 0:
@@ -262,10 +300,10 @@ class StandardTrainerAprilUpdate(SAETrainer):
             non_shared_l1_loss = 0
             
             # For each model subspace
-            for k in range(n_models):
+            for k in range(self.n_models):
                 # Get the model's subspace in the decoder weights
-                start_idx = k * activation_dim
-                end_idx = (k + 1) * activation_dim
+                start_idx = k * activation_dim_per_model
+                end_idx = (k + 1) * activation_dim_per_model
                 model_decoder_weights = self.ae.decoder.weight[start_idx:end_idx, :]
                 
                 # Calculate norms for this model's subspace
@@ -289,10 +327,10 @@ class StandardTrainerAprilUpdate(SAETrainer):
             l1_loss = 0
             
             # For each model subspace
-            for k in range(n_models):
+            for k in range(self.n_models):
                 # Get the model's subspace in the decoder weights
-                start_idx = k * activation_dim
-                end_idx = (k + 1) * activation_dim
+                start_idx = k * activation_dim_per_model
+                end_idx = (k + 1) * activation_dim_per_model
                 model_decoder_weights = self.ae.decoder.weight[start_idx:end_idx]
                 
                 # Add L1 loss from this model's subspace
@@ -314,7 +352,7 @@ class StandardTrainerAprilUpdate(SAETrainer):
             )
 
 
-    def update(self, step, activations):
+    def update(self, step, activations, log_queues=None):
         activations = activations.to(self.device)
 
         self.optimizer.zero_grad()
@@ -326,24 +364,30 @@ class StandardTrainerAprilUpdate(SAETrainer):
         # Enforce weight sharing for shared features after each optimization step
         if self.frac_features_shared > 0:
             with t.no_grad():
-                activation_dim = self.ae.activation_dim
-                n_models = activation_dim // self.ae.decoder.weight.shape[0]
-                d_model = activation_dim // n_models
+                activation_dim_per_model = self.total_activation_dim // self.n_models
                 
                 # For each shared feature, average its weights across all model subspaces
                 for i in range(self.num_shared_features):
                     # Get all weights for this feature across different model subspaces
                     feature_weights = []
-                    for k in range(n_models):
-                        feature_weights.append(self.ae.decoder.weight[:, i + k * d_model])
+                    for k in range(self.n_models):
+                        start_idx = k * activation_dim_per_model
+                        end_idx = (k + 1) * activation_dim_per_model
+                        feature_weights.append(self.ae.decoder.weight[start_idx:end_idx, i])
                     
                     # Calculate the average weight
                     avg_weight = t.stack(feature_weights).mean(dim=0)
                     
                     # Set all weights for this feature to the average
-                    for k in range(n_models):
-                        self.ae.decoder.weight[:, i + k * d_model] = avg_weight
+                    for k in range(self.n_models):
+                        start_idx = k * activation_dim_per_model
+                        end_idx = (k + 1) * activation_dim_per_model
+                        self.ae.decoder.weight[start_idx:end_idx, i] = avg_weight
         
+        # Log decoder projections to wandb if applicable (every 100 steps)
+        if step % 50 == 0:
+            self.hist_decoder_projections()
+            
         self.scheduler.step()
 
     @property
@@ -351,7 +395,9 @@ class StandardTrainerAprilUpdate(SAETrainer):
         return {
             'dict_class': 'AutoEncoder',
             'trainer_class' : 'StandardTrainerAprilUpdate',
-            'activation_dim': self.ae.activation_dim,
+            'activation_dim_per_model': self.total_activation_dim // self.n_models,
+            'total_activation_dim': self.total_activation_dim,
+            'n_models': self.n_models,
             'dict_size': self.ae.dict_size,
             'lr' : self.lr,
             'l1_penalty' : self.l1_penalty,
@@ -369,4 +415,3 @@ class StandardTrainerAprilUpdate(SAETrainer):
             'shared_l1_penalty': self.shared_l1_penalty,
             'num_shared_features': getattr(self, 'num_shared_features', 0),
         }
-

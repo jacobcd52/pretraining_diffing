@@ -14,7 +14,7 @@ dtype = t.bfloat16
 #%%
 layer = 7
 expansion = 2*32
-num_tokens = int(500e6)
+num_tokens = int(10e6)
 out_batch_size = 8192*2
 # model_name_list = ["unsloth/Qwen2.5-Coder-32B-Instruct", "emergent-misalignment/Qwen-Coder-Insecure"]
 model_name_list = ["Qwen/Qwen2.5-0.5B", "Qwen/Qwen2.5-0.5B-Instruct"]
@@ -36,15 +36,6 @@ for i, model_name in enumerate(model_name_list):
 activation_dim = 896
 dictionary_size = expansion * activation_dim
 
-dataset = load_dataset(
-    'Skylion007/openwebtext', 
-    split='train', 
-    streaming=True,
-    trust_remote_code=True
-    )
-
-dataset = dataset.shuffle()
-
 class CustomData():
     def __init__(self, dataset):
         self.data = iter(dataset)
@@ -55,10 +46,39 @@ class CustomData():
     def __next__(self):
         return next(self.data)['text']
 
+dataset = load_dataset(
+    'Skylion007/openwebtext', 
+    split='train', 
+    streaming=True,
+    trust_remote_code=True
+    )
+
+dataset = dataset.shuffle()
 data = CustomData(dataset)
 
+
+class CustomDataChat():
+    def __init__(self, dataset):
+        self.data = iter(dataset)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        conv = next(self.data)['conversation']
+        return model_list[1].tokenizer.apply_chat_template(conv, tokenize=False)
+
+dataset_2 = load_dataset(
+    'lmsys/lmsys-chat-1m', 
+    split='train', 
+    streaming=True,
+    trust_remote_code=True
+    )
+dataset_2 = dataset_2.shuffle()
+data_2 = CustomDataChat(dataset_2)
+
 buffer = MultiModelActivationBuffer(
-    data=data,
+    data_list=[data, data_2],
     model_list=model_list,
     submodule_list=submodule_list,
     d_submodule=activation_dim, # output dimension of the model component
@@ -75,19 +95,19 @@ buffer = MultiModelActivationBuffer(
 trainer_cfg = {
     "trainer": StandardTrainerAprilUpdate,
     "dict_class": AutoEncoder,
-    "activation_dim": activation_dim * len(model_list),
+    "activation_dim": activation_dim,  # Now correctly the dimension per model
+    "n_models": len(model_list),       # Added n_models parameter
     "dict_size": dictionary_size,
     "device": "cuda:2",
     "steps": num_tokens // out_batch_size,
     "layer": layer,
     "lm_name": "blah",
-    "warmup_steps": 20,
+    "warmup_steps": 0, #num_tokens // out_batch_size * 0.1,
     "l1_penalty": 1e-1,
-    "lr": 1e-5,
-    "sparsity_warmup_steps": 20,
+    "lr": 1e-4,
+    "sparsity_warmup_steps": 0,
     "frac_features_shared": 0.04,
     "shared_l1_penalty": 2e-2,
-
 }
 
 # train the sparse autoencoder (SAE)
@@ -98,11 +118,9 @@ ae = trainSAE(
     autocast_dtype=dtype,
     use_wandb=True,
     wandb_project="insecure diffing",
-    log_steps=20,
+    log_steps=10,
     hf_repo_out="jacobcd52/insecure_diffing",
     save_dir="/root/pretraining_diffing/checkpoints/",
     normalize_activations=True,
 )
-
-
 # %%

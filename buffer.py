@@ -2,19 +2,8 @@ import torch as t
 from nnsight import LanguageModel
 import gc
 from tqdm import tqdm
-
-from config import DEBUG
-
-if DEBUG:
-    tracer_kwargs = {'scan' : True, 'validate' : True}
-else:
-    tracer_kwargs = {'scan' : False, 'validate' : False}
-
-
-import torch as t
-from nnsight import LanguageModel
-import gc
-from tqdm import tqdm
+import threading
+import random  # Added for random dataset selection
 
 from config import DEBUG
 
@@ -31,7 +20,7 @@ class MultiModelActivationBuffer:
     yields them in batches, and refreshes them when the buffer is less than half full.
     """
     def __init__(self, 
-                data, # generator which yields text data
+                data_list, # list of generators which yield text data
                 model_list, # list of LanguageModels from which to extract activations
                 submodule_list, # list of submodules from which to extract activations
                 d_submodule=None, # submodule dimension; if None, try to detect automatically
@@ -48,6 +37,15 @@ class MultiModelActivationBuffer:
             
             if io not in ['in', 'out']:
                 raise ValueError("io must be either 'in' or 'out'")
+
+            # Support for multiple datasets
+            if not isinstance(data_list, list):
+                self.data_list = [data_list]  # Convert single dataset to list
+            else:
+                self.data_list = data_list
+            
+            self.n_datasets = len(self.data_list)
+            print(f"Initialized with {self.n_datasets} datasets")
 
             self.n_models = len(model_list)
             if len(submodule_list) != self.n_models:
@@ -71,11 +69,13 @@ class MultiModelActivationBuffer:
                     except:
                         raise ValueError("d_submodule cannot be inferred for all submodules")
 
-            # Change: store activations with concatenated dimension
+            # Store activations with concatenated dimension
             self.activations = t.empty(0, self.n_models * d_submodule, device=device, dtype=model_list[0].dtype)
             self.read = t.zeros(0).bool()
 
-            self.data = data
+            # Track which dataset each activation came from
+            self.dataset_indices = t.empty(0, dtype=t.long, device=device)
+
             self.model_list = model_list
             self.submodule_list = submodule_list
             self.d_submodule = d_submodule
@@ -121,7 +121,7 @@ class MultiModelActivationBuffer:
                                 hidden_states = hidden_states[:, 1:, :]
                                 attn_mask = attn_mask[:, 1:]
                             hidden_states = hidden_states[attn_mask != 0]
-                            batch_acts.append(hidden_states.cpu())
+                            batch_acts.append(hidden_states)
                             
                             del hidden_states
                             del input
@@ -192,8 +192,6 @@ class MultiModelActivationBuffer:
         Refreshes the activation buffer with new activations.
         This fixed version ensures consistent activations across different devices.
         """
-        import threading
-        
         gc.collect()
         t.cuda.empty_cache()
         
@@ -201,25 +199,56 @@ class MultiModelActivationBuffer:
         if len(self.read) == 0:
             self.activations = t.empty(0, self.n_models * self.d_submodule, 
                                     device=self.device, dtype=self.model_list[0].dtype)
+            self.dataset_indices = t.empty(0, dtype=t.long, device=self.device)
             current_idx = 0
         else:
             # Filter out read activations
             self.activations = self.activations[~self.read]
+            self.dataset_indices = self.dataset_indices[~self.read]
             current_idx = len(self.activations)
         
         # Create new buffer
         new_activations = t.empty(self.activation_buffer_size, self.n_models * self.d_submodule, 
                                 device=self.device, dtype=self.model_list[0].dtype)
+        new_dataset_indices = t.empty(self.activation_buffer_size, dtype=t.long, device=self.device)
 
         # Copy over existing activations if there are any
         if current_idx > 0:
             new_activations[:current_idx] = self.activations
+            new_dataset_indices[:current_idx] = self.dataset_indices
         
         self.activations = new_activations
+        self.dataset_indices = new_dataset_indices
 
+        # Calculate per-dataset targets for balanced sampling
+        targets_per_dataset = [
+            (self.activation_buffer_size - current_idx) // self.n_datasets 
+            for _ in range(self.n_datasets)
+        ]
+        # Add remainder to the first dataset
+        remainder = (self.activation_buffer_size - current_idx) % self.n_datasets
+        for i in range(remainder):
+            targets_per_dataset[i] += 1
+            
+        # Track counts of tokens added from each dataset
+        current_dataset_counts = [0] * self.n_datasets
+        
         while current_idx < self.activation_buffer_size:
-            # Get a batch of text and tokenize on the CPU first
-            tokens = self.tokenized_batch()
+            # Determine which dataset to use
+            available_datasets = [
+                i for i, (count, target) in enumerate(zip(current_dataset_counts, targets_per_dataset))
+                if count < target
+            ]
+            
+            if not available_datasets:
+                # This shouldn't happen, but if it does, we're done
+                break
+                
+            # Select a dataset that hasn't reached its target yet
+            dataset_idx = random.choice(available_datasets)
+            
+            # Get a batch of text from the selected dataset and tokenize on the CPU first
+            tokens = self.tokenized_batch(dataset_idx=dataset_idx)
             tokens_cpu = {k: v.cpu() for k, v in tokens.items()}  # Ensure tokens start on CPU
             
             all_model_activations = [None] * self.n_models
@@ -227,121 +256,23 @@ class MultiModelActivationBuffer:
             model_errors = [False] * self.n_models
             model_locks = [threading.Lock() for _ in range(self.n_models)]
 
-            # Define a function to process each model in parallel
-            def process_model(model_idx):
-                """
-                Process a single model to extract activations.
-                Ensures consistent results across different devices.
-                """
-                model = self.model_list[model_idx]
-                submodule = self.submodule_list[model_idx]
-                try:
-                    # Ensure we start with the exact same tokens on CPU 
-                    # and only move to the model's device at the last possible moment
-                    tokens_device = {k: v.clone().to(model.device) for k, v in tokens_cpu.items()}
-                    
-                    with t.no_grad():
-                        # Ensure deterministic computation
-                        # Use try-except for older PyTorch versions
-                        try:
-                            old_deterministic_setting = t.is_deterministic_algorithms_enabled()
-                            t.use_deterministic_algorithms(True)
-                        except (AttributeError, RuntimeError):
-                            # Fall back for older PyTorch that doesn't have these functions
-                            old_deterministic_setting = False
-                        
-                        # Store the previous CUDA state to restore it after
-                        old_cuda_state = t.cuda.get_rng_state() if t.cuda.is_available() else None
-                        if t.cuda.is_available():
-                            # Set a fixed seed for this operation on the specific device
-                            device_idx = model.device.index if model.device.type == 'cuda' else 0
-                            t.cuda.manual_seed(42 + device_idx)
-                        
-                        with model.trace(
-                            tokens_device,
-                            **tracer_kwargs,
-                            invoker_args={"truncation": True, "max_length": self.ctx_len},
-                        ):
-                            if self.io == "in":
-                                hidden_states = submodule.inputs[0].save()
-                            else:
-                                hidden_states = submodule.output.save()
-                            input = model.inputs.save()
-                            submodule.output.stop()
-                        
-                        # Restore random state
-                        if t.cuda.is_available() and old_cuda_state is not None:
-                            t.cuda.set_rng_state(old_cuda_state)
-                        
-                        # Restore deterministic setting
-                        try:
-                            t.use_deterministic_algorithms(old_deterministic_setting)
-                        except (AttributeError, RuntimeError):
-                            # Skip for older PyTorch versions
-                            pass
-                        
-                        # Get attention mask and hidden states
-                        attn_mask = input.value[1]["attention_mask"]
-                        hidden_states_value = hidden_states.value
-                        
-                        if isinstance(hidden_states_value, tuple):
-                            hidden_states_value = hidden_states_value[0]
-                        
-                        # First get the raw hidden states to CPU for consistent processing
-                        # This is the key step - moving to CPU before any manipulations
-                        hidden_states_cpu = hidden_states_value.cpu()
-                        attn_mask_cpu = attn_mask.cpu()
-                        
-                        # Process BOS token removal on CPU
-                        if self.remove_bos:
-                            hidden_states_cpu = hidden_states_cpu[:, 1:, :]
-                            attn_mask_cpu = attn_mask_cpu[:, 1:]
-                        
-                        # Extract valid token activations (where attention mask is 1) on CPU
-                        valid_indices = attn_mask_cpu.nonzero()
-                        if valid_indices.shape[0] > 0:
-                            batch_indices = valid_indices[:, 0]
-                            seq_indices = valid_indices[:, 1]
-                            hidden_states_cpu = hidden_states_cpu[batch_indices, seq_indices]
-                        else:
-                            hidden_states_cpu = hidden_states_cpu.new_zeros((0, hidden_states_cpu.size(-1)))
-                        
-                        # Skip if no activations were produced
-                        if hidden_states_cpu.shape[0] == 0:
-                            print(f"Warning: Model {model_idx} produced no activations. Skipping batch.")
-                            model_errors[model_idx] = True
-                            return
-                        
-                        # Only now move the processed activations to the target device
-                        hidden_states_device = hidden_states_cpu.to(self.device, non_blocking=True)
-                        
-                        # Use a lock to safely update the shared lists
-                        with model_locks[model_idx]:
-                            all_model_activations[model_idx] = hidden_states_device
-                            all_seq_lengths[model_idx] = len(hidden_states_device)
-                        
-                        # Clear GPU tensors explicitly
-                        del hidden_states
-                        del input
-                        del attn_mask
-                        del hidden_states_value
-                        del hidden_states_cpu
-                        t.cuda.empty_cache()
-                        
-                except Exception as e:
-                    print(f"Error processing model {model_idx}: {e}")
-                    model_errors[model_idx] = True
+            # Check if models are on different devices
+            model_devices = [model.device for model in self.model_list]
+            use_threading = len(set(model_devices)) > 1
 
-            # Start a thread for each model
-            threads = []
-            for i in range(self.n_models):
-                thread = threading.Thread(target=process_model, args=(i,))
-                thread.start()
-                threads.append(thread)
-            
-            # Wait for all threads to complete
-            for thread in threads:
-                thread.join()
+            # Process models either in threads or sequentially
+            if use_threading:
+                threads = []
+                for i in range(self.n_models):
+                    thread = threading.Thread(target=self.process_model, args=(i, tokens_cpu, all_model_activations, all_seq_lengths, model_errors, model_locks))
+                    thread.start()
+                    threads.append(thread)
+                # Wait for all threads to complete
+                for thread in threads:
+                    thread.join()
+            else:
+                for i in range(self.n_models):
+                    self.process_model(i, tokens_cpu, all_model_activations, all_seq_lengths, model_errors, model_locks)
                 
             # Check if any model had an error
             if any(model_errors):
@@ -362,13 +293,18 @@ class MultiModelActivationBuffer:
                     
             # Use the minimum sequence length across models
             min_seq_length = min(all_seq_lengths)
-            remaining_space = self.activation_buffer_size - current_idx
-            min_seq_length = min(min_seq_length, remaining_space)
+            
+            # Calculate remaining space in the buffer for this dataset
+            remaining_for_dataset = targets_per_dataset[dataset_idx] - current_dataset_counts[dataset_idx]
+            # Calculate how much we can add from this batch
+            to_add = min(min_seq_length, remaining_for_dataset)
+            # Also ensure we don't exceed the buffer size
+            to_add = min(to_add, self.activation_buffer_size - current_idx)
             
             # Stack instead of concatenate
             try:
                 # Stack directly on the destination device
-                stacked_activations = t.stack([acts[:min_seq_length] for acts in all_model_activations], dim=1)
+                stacked_activations = t.stack([acts[:to_add] for acts in all_model_activations], dim=1)
                 
                 if self.rescale_acts:
                     stacked_activations = self.apply_rescaling(stacked_activations)
@@ -377,8 +313,15 @@ class MultiModelActivationBuffer:
                 concat_activations = stacked_activations.reshape(stacked_activations.shape[0], -1)
                 
                 # Store in buffer
-                self.activations[current_idx:current_idx + min_seq_length] = concat_activations
-                current_idx += min_seq_length
+                self.activations[current_idx:current_idx + to_add] = concat_activations
+                # Store dataset indices
+                self.dataset_indices[current_idx:current_idx + to_add] = dataset_idx
+                
+                current_idx += to_add
+                current_dataset_counts[dataset_idx] += to_add
+                
+                # print(f"Added {to_add} tokens from dataset {dataset_idx}. "
+                #       f"Current counts: {current_dataset_counts}")
                 
             except Exception as e:
                 print(f"Error stacking activations: {str(e)}")
@@ -394,7 +337,118 @@ class MultiModelActivationBuffer:
         
         # Initialize read mask for the new buffer
         self.read = t.zeros(len(self.activations), dtype=t.bool, device=self.device)
-    
+        
+        # # Print balance of datasets in the buffer
+        # unique_indices, counts = t.unique(self.dataset_indices, return_counts=True)
+        # print("Dataset balance in buffer:")
+        # for idx, count in zip(unique_indices.tolist(), counts.tolist()):
+        #     percentage = 100 * count / len(self.dataset_indices)
+        #     print(f"  Dataset {idx}: {count} tokens ({percentage:.2f}%)")
+
+    def process_model(self, model_idx, tokens_cpu, all_model_activations, all_seq_lengths, model_errors, model_locks):
+        """
+        Process a single model to extract activations.
+        Ensures consistent results across different devices.
+        """
+        model = self.model_list[model_idx]
+        submodule = self.submodule_list[model_idx]
+        try:
+            # Ensure we start with the exact same tokens on CPU 
+            # and only move to the model's device at the last possible moment
+            tokens_device = {k: v.clone().to(model.device) for k, v in tokens_cpu.items()}
+            
+            with t.no_grad():
+                # Ensure deterministic computation
+                # Use try-except for older PyTorch versions
+                try:
+                    old_deterministic_setting = t.is_deterministic_algorithms_enabled()
+                    t.use_deterministic_algorithms(True)
+                except (AttributeError, RuntimeError):
+                    # Fall back for older PyTorch that doesn't have these functions
+                    old_deterministic_setting = False
+                
+                # Store the previous CUDA state to restore it after
+                old_cuda_state = t.cuda.get_rng_state() if t.cuda.is_available() else None
+                if t.cuda.is_available():
+                    # Set a fixed seed for this operation on the specific device
+                    device_idx = model.device.index if model.device.type == 'cuda' else 0
+                    t.cuda.manual_seed(42 + device_idx)
+                
+                with model.trace(
+                    tokens_device,
+                    **tracer_kwargs,
+                    invoker_args={"truncation": True, "max_length": self.ctx_len},
+                ):
+                    if self.io == "in":
+                        hidden_states = submodule.inputs[0].save()
+                    else:
+                        hidden_states = submodule.output.save()
+                    input = model.inputs.save()
+                    submodule.output.stop()
+                
+                # Restore random state
+                if t.cuda.is_available() and old_cuda_state is not None:
+                    t.cuda.set_rng_state(old_cuda_state)
+                
+                # Restore deterministic setting
+                try:
+                    t.use_deterministic_algorithms(old_deterministic_setting)
+                except (AttributeError, RuntimeError):
+                    # Skip for older PyTorch versions
+                    pass
+                
+                # Get attention mask and hidden states
+                attn_mask = input.value[1]["attention_mask"]
+                hidden_states_value = hidden_states.value
+                
+                if isinstance(hidden_states_value, tuple):
+                    hidden_states_value = hidden_states_value[0]
+                
+                # First get the raw hidden states to CPU for consistent processing
+                # This is the key step - moving to CPU before any manipulations
+                hidden_states_cpu = hidden_states_value.cpu()
+                attn_mask_cpu = attn_mask.cpu()
+                
+                # Process BOS token removal on CPU
+                if self.remove_bos:
+                    hidden_states_cpu = hidden_states_cpu[:, 1:, :]
+                    attn_mask_cpu = attn_mask_cpu[:, 1:]
+                
+                # Extract valid token activations (where attention mask is 1) on CPU
+                valid_indices = attn_mask_cpu.nonzero()
+                if valid_indices.shape[0] > 0:
+                    batch_indices = valid_indices[:, 0]
+                    seq_indices = valid_indices[:, 1]
+                    hidden_states_cpu = hidden_states_cpu[batch_indices, seq_indices]
+                else:
+                    hidden_states_cpu = hidden_states_cpu.new_zeros((0, hidden_states_cpu.size(-1)))
+                
+                # Skip if no activations were produced
+                if hidden_states_cpu.shape[0] == 0:
+                    print(f"Warning: Model {model_idx} produced no activations. Skipping batch.")
+                    model_errors[model_idx] = True
+                    return
+                
+                # Only now move the processed activations to the target device
+                hidden_states_device = hidden_states_cpu.to(self.device, non_blocking=True)
+                
+                # Use a lock to safely update the shared lists
+                with model_locks[model_idx]:
+                    all_model_activations[model_idx] = hidden_states_device
+                    all_seq_lengths[model_idx] = len(hidden_states_device)
+                
+                # Clear GPU tensors explicitly
+                del hidden_states
+                del input
+                del attn_mask
+                del hidden_states_value
+                del hidden_states_cpu
+                t.cuda.empty_cache()
+                
+        except Exception as e:
+            print(f"Error processing model {model_idx}: {e}")
+            model_errors[model_idx] = True
+
     def __iter__(self):
         return self
 
@@ -407,30 +461,81 @@ class MultiModelActivationBuffer:
             if (~self.read).sum() < self.activation_buffer_size // 2:
                 self.refresh()
 
-            # return a batch
+            # Select tokens in a balanced way from all datasets
             unreads = (~self.read).nonzero().squeeze()
-            idxs = unreads[t.randperm(len(unreads), device=unreads.device)[:self.out_batch_size]]
-            self.read[idxs] = True
-            return self.activations[idxs]
+            if len(unreads) == 0:
+                self.refresh()
+                unreads = (~self.read).nonzero().squeeze()
+                
+            # Get indices of available tokens
+            avail_indices = unreads[t.randperm(len(unreads), device=unreads.device)]
+            avail_datasets = self.dataset_indices[avail_indices]
+            
+            # How many tokens to select per dataset for this batch
+            tokens_per_dataset = self.out_batch_size // self.n_datasets
+            extras = self.out_batch_size % self.n_datasets
+            
+            # Initialize selected_indices
+            selected_indices = []
+            
+            # Select tokens from each dataset
+            for dataset_idx in range(self.n_datasets):
+                # Find tokens from this dataset
+                dataset_mask = (avail_datasets == dataset_idx)
+                dataset_indices = avail_indices[dataset_mask]
+                
+                # Determine how many to select from this dataset
+                to_select = tokens_per_dataset + (1 if dataset_idx < extras else 0)
+                to_select = min(to_select, len(dataset_indices))
+                
+                if to_select > 0:
+                    # Select random subset
+                    selected = dataset_indices[:to_select]
+                    selected_indices.append(selected)
+            
+            # Combine all selected indices
+            if selected_indices:
+                idxs = t.cat(selected_indices)
+                # Mark as read
+                self.read[idxs] = True
+                return self.activations[idxs]
+            else:
+                # This should not happen, but if it does, return an empty batch
+                print("Warning: No tokens available. This should not happen.")
+                return t.empty(0, self.n_models * self.d_submodule, 
+                              device=self.device, dtype=self.model_list[0].dtype)
     
-    def text_batch(self, batch_size=None):
+    def text_batch(self, batch_size=None, dataset_idx=None):
         """
-        Return a list of text
+        Return a list of text from a specific dataset or random dataset
         """
         if batch_size is None:
             batch_size = self.refresh_batch_size
+            
+        # If dataset_idx is not specified, choose randomly
+        if dataset_idx is None:
+            dataset_idx = random.randrange(self.n_datasets)
+            
         try:
             return [
-                next(self.data) for _ in range(batch_size)
+                next(self.data_list[dataset_idx]) for _ in range(batch_size)
             ]
         except StopIteration:
-            raise StopIteration("End of data stream reached")
+            print(f"Dataset {dataset_idx} has been exhausted. Restarting...")
+            # Try to reset the generator if possible
+            try:
+                self.data_list[dataset_idx] = self.data_list[dataset_idx].__iter__()
+                return [
+                    next(self.data_list[dataset_idx]) for _ in range(batch_size)
+                ]
+            except:
+                raise StopIteration(f"End of data stream reached for dataset {dataset_idx} and cannot reset")
     
-    def tokenized_batch(self, batch_size=None, model_idx=0):
+    def tokenized_batch(self, batch_size=None, model_idx=0, dataset_idx=None):
         """
-        Return a batch of tokenized inputs.
+        Return a batch of tokenized inputs from a specific dataset or random dataset.
         """
-        texts = self.text_batch(batch_size=batch_size)
+        texts = self.text_batch(batch_size=batch_size, dataset_idx=dataset_idx)
         return self.model_list[model_idx].tokenizer(
             texts,
             return_tensors='pt',
@@ -460,7 +565,7 @@ class MultiModelActivationBuffer:
         
         return whitened_acts
     
-    def get_seq_batch(self):
+    def get_seq_batch(self, dataset_idx=None):
         """
         Return a batch of activations with shape [batch, seq, n_models*d] along with their corresponding tokens.
         This fixed version ensures consistent activations across different devices.
@@ -469,7 +574,7 @@ class MultiModelActivationBuffer:
             activations: tensor of shape [batch, seq, n_models*d]
             tokens: tensor of shape [batch, seq]
         """
-        tokens = self.tokenized_batch()
+        tokens = self.tokenized_batch(dataset_idx=dataset_idx)
         tokens_cpu = {k: v.cpu() for k, v in tokens.items()}  # Ensure tokens start on CPU
         
         all_model_activations = []
@@ -528,16 +633,13 @@ class MultiModelActivationBuffer:
                 hidden_states_value = hidden_states.value
                 if isinstance(hidden_states_value, tuple):
                     hidden_states_value = hidden_states_value[0]
-                    
-                # Move to CPU for consistent processing
-                hidden_states_cpu = hidden_states_value.cpu()
                 
                 if self.remove_bos:
-                    hidden_states_cpu = hidden_states_cpu[:, 1:, :]
+                    hidden_states_value = hidden_states_value[:, 1:, :]
                 
-                # Append to list (keep on CPU)
-                all_model_activations.append(hidden_states_cpu)
-                all_seq_lengths.append(hidden_states_cpu.shape[1])
+                # Append to list
+                all_model_activations.append(hidden_states_value.to(self.device))
+                all_seq_lengths.append(hidden_states_value.shape[1])
 
                 # Clear GPU tensors explicitly
                 del hidden_states
@@ -578,6 +680,7 @@ class MultiModelActivationBuffer:
     @property
     def config(self):
         return {
+            'n_datasets': self.n_datasets,
             'n_models': self.n_models,
             'd_submodule': self.d_submodule,
             'io': self.io,
@@ -588,9 +691,32 @@ class MultiModelActivationBuffer:
             'device': self.device,
             'rescale_acts': self.rescale_acts,
         }
-
+            
+    def get_dataset_distribution(self):
+        """
+        Returns the distribution of tokens from each dataset in the buffer.
+        """
+        if len(self.dataset_indices) == 0:
+            return {i: 0 for i in range(self.n_datasets)}
+            
+        unique_indices, counts = t.unique(self.dataset_indices, return_counts=True)
+        distribution = {}
+        for i in range(self.n_datasets):
+            idx = (unique_indices == i).nonzero()
+            if len(idx) > 0:
+                distribution[i] = counts[idx].item() / len(self.dataset_indices)
+            else:
+                distribution[i] = 0
+        return distribution
+    
     def close(self):
         """
-        Close the text stream and the underlying compressed file.
+        Close all data streams.
         """
-        self.text_stream.close()
+        for data_stream in self.data_list:
+            try:
+                data_stream.close()
+            except:
+                pass
+
+

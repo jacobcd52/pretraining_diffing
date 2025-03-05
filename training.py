@@ -254,9 +254,11 @@ def trainSAE(
                         trainer.ae.scale_biases(1 / norm_factor)
 
         # training
-        for trainer in trainers:
+        for i, trainer in enumerate(trainers):
             with autocast_context:
-                trainer.update(step, act)
+                # Pass the log queues to the update method
+                current_queue = log_queues[i] if use_wandb and i < len(log_queues) else None
+                trainer.update(step, act, log_queues=[current_queue] if current_queue else None)
 
     # save final SAEs
     for save_dir, trainer in zip(save_dirs, trainers):
