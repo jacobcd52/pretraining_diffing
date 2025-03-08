@@ -156,7 +156,9 @@ class AutoEncoderTopK(Dictionary, nn.Module):
         return autoencoder
 
     @classmethod
-    def from_hf(cls, repo_id: str, trainer_idx: int = 0, k: Optional[int] = None, device=None):
+    def from_hf(cls, repo_id: str, trainer_idx: int = 0, k: Optional[int] = None, device=None,
+    weights_filename: Optional[str] = None, config_filename: Optional[str] = None, 
+    is_eleuther: bool = False, threshold: float = -1.0):
         """
         Load a pretrained autoencoder from HuggingFace Hub.
         
@@ -165,37 +167,185 @@ class AutoEncoderTopK(Dictionary, nn.Module):
             trainer_idx: int, which trainer's model to load if multiple were saved
             k: Optional[int], override the k value from the saved model
             device: Optional[str], device to load the model to
+            weights_filename: Optional[str], custom filename for the weights file
+            config_filename: Optional[str], custom filename for the config file
+            is_eleuther: bool, whether the weights are in Eleuther format
+            threshold: float, threshold value to use for Eleuther format weights
         """
         from huggingface_hub import hf_hub_download
+        import os
+        import json
+        
+        if weights_filename is None:
+            # Try to find the appropriate weights file with either extension
+            for extension in [".pt", ".safetensors"]:
+                try:
+                    weights_filename = f"trainer_{trainer_idx}/ae{extension}"
+                    # Attempt to download to see if file exists
+                    hf_hub_download(
+                        repo_id=repo_id,
+                        filename=weights_filename,
+                        repo_type="model"
+                    )
+                    # If we get here, the file exists
+                    break
+                except Exception:
+                    weights_filename = None
+                    continue
+                    
+            # If we still don't have a weights filename, use the default .pt
+            if weights_filename is None:
+                weights_filename = f"trainer_{trainer_idx}/ae.pt"
+                
+        if config_filename is None:
+            config_filename = f"trainer_{trainer_idx}/config.json"
         
         try:
+            # Download the config file first to get k value
+            config_path = hf_hub_download(
+                repo_id=repo_id,
+                filename=config_filename,
+                repo_type="model"
+            )
+            
+            # Load config to get k
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+            
+            # Use provided k or the one from config
+            config_k = config.get("k")
+            if k is None and config_k is not None:
+                k = config_k
+            
             # Download the model file
             model_path = hf_hub_download(
                 repo_id=repo_id,
-                filename=f"trainer_{trainer_idx}/ae.pt",
+                filename=weights_filename,
                 repo_type="model"
             )
             
-            # Download the config file
-            config_path = hf_hub_download(
-                repo_id=repo_id,
-                filename=f"trainer_{trainer_idx}/config.json",
-                repo_type="model"
-            )
+            # Load the model based on file extension
+            file_extension = os.path.splitext(model_path)[1].lower()
+            if file_extension == '.safetensors':
+                try:
+                    import safetensors.torch
+                    # Load the safetensors file
+                    state_dict = safetensors.torch.load_file(model_path)
+                    
+                    # Handle Eleuther format if needed
+                    if is_eleuther:
+                        # Determine dimensions from the state dict
+                        if 'encoder.weight' in state_dict:
+                            dict_size, activation_dim = state_dict['encoder.weight'].shape
+                        elif 'W_dec' in state_dict:
+                            activation_dim, dict_size = state_dict['W_dec'].shape
+                        else:
+                            raise ValueError("Cannot determine model dimensions from state dict")
+                        
+                        # Create the model
+                        autoencoder = cls(activation_dim, dict_size, k if k is not None else 1)
+                        
+                        # Convert the state dict
+                        converted_dict = autoencoder.convert_eleuther(state_dict, k, threshold)
+                        
+                        # Load the converted state dict
+                        autoencoder.load_state_dict(converted_dict)
+                    else:
+                        # Then create the model from the state dict manually
+                        dict_size, activation_dim = state_dict["encoder.weight"].shape
+                        
+                        autoencoder = cls(activation_dim, dict_size, k)
+                        autoencoder.load_state_dict(state_dict)
+                    
+                    if device is not None:
+                        autoencoder.to(device)
+                except ImportError:
+                    raise ImportError(
+                        "safetensors package is required to load .safetensors files. "
+                        "Install with: pip install safetensors"
+                    )
+            else:  # Default to .pt loading
+                # Load the state dict
+                state_dict = t.load(model_path)
+                
+                if is_eleuther:
+                    # Determine dimensions from the state dict
+                    if 'encoder.weight' in state_dict:
+                        dict_size, activation_dim = state_dict['encoder.weight'].shape
+                    elif 'W_dec' in state_dict:
+                        activation_dim, dict_size = state_dict['W_dec'].shape
+                    else:
+                        raise ValueError("Cannot determine model dimensions from state dict")
+                    
+                    # Create the model
+                    autoencoder = cls(activation_dim, dict_size, k if k is not None else 1)
+                    
+                    # Convert the state dict
+                    converted_dict = autoencoder.convert_eleuther(state_dict, k, threshold)
+                    
+                    # Load the converted state dict
+                    autoencoder.load_state_dict(converted_dict)
+                else:
+                    autoencoder = cls.from_pretrained(model_path, k=k, device=device)
             
-            # Load the model
-            autoencoder = cls.from_pretrained(model_path, k=k, device=device)
-            
-            # Optionally load and attach config
-            import json
-            with open(config_path, 'r') as f:
-                config = json.load(f)
+            # Attach config to the model
             autoencoder.config = config
             
             return autoencoder
             
         except Exception as e:
             raise RuntimeError(f"Error loading model from HuggingFace Hub: {str(e)}")
+        
+    def convert_eleuther(self, state_dict, k=None, threshold=-1.0):
+        """
+        Convert a state dict from Eleuther format to the format expected by this model.
+        
+        Args:
+            state_dict: dict, the state dictionary in Eleuther format with keys like 
+                    'W_dec', 'b_dec', 'encoder.bias', 'encoder.weight'
+            k: Optional[int], the value of k to use if not present in the state dict
+            threshold: float, the threshold value to use if not present in the state dict
+        
+        Returns:
+            dict: A converted state dictionary compatible with this model
+        """
+        converted_dict = {}
+        
+        # Handle W_dec tensor which needs to be transposed
+        if 'W_dec' in state_dict:
+            # W_dec in Eleuther format is [activation_dim, dict_size]
+            # decoder.weight in our format is [dict_size, activation_dim]
+            converted_dict['decoder.weight'] = state_dict['W_dec'].T
+        
+        # Handle other tensors that can be copied directly
+        for old_key, new_key in {
+            'b_dec': 'b_dec',
+            'encoder.bias': 'encoder.bias',
+            'encoder.weight': 'encoder.weight'
+        }.items():
+            if old_key in state_dict:
+                converted_dict[new_key] = state_dict[old_key]
+        
+        # Set k if not in state_dict
+        if k is not None:
+            converted_dict['k'] = t.tensor(k, dtype=t.int)
+        elif 'k' in state_dict:
+            converted_dict['k'] = state_dict['k']
+        else:
+            # Use the current k value if available
+            converted_dict['k'] = self.k
+        
+        # Set threshold if not in state_dict
+        converted_dict['threshold'] = t.tensor(threshold, dtype=t.float32)
+        
+        # If act_mean and act_cov_inv_sqrt are in the original state_dict, copy them
+        if 'act_mean' in state_dict:
+            converted_dict['act_mean'] = state_dict['act_mean']
+        
+        if 'act_cov_inv_sqrt' in state_dict:
+            converted_dict['act_cov_inv_sqrt'] = state_dict['act_cov_inv_sqrt']
+        
+        return converted_dict
 
 
 class TopKTrainer(SAETrainer):
